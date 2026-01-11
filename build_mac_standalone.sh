@@ -12,21 +12,44 @@ pip3 install -r requirements.txt
 echo "Cleaning previous builds..."
 rm -rf build dist "PowerPoint Combiner.app"
 
+# Initialize PyInstaller args
+PYINSTALLER_ARGS=(
+    --name "PowerPoint Combiner"
+    --windowed
+    --onedir
+    --clean
+    --hidden-import=pptx
+    --hidden-import=pptx.presentation
+    --hidden-import=pptx.util
+    --hidden-import=pptx.enum
+    --hidden-import=lxml
+    --hidden-import=lxml.etree
+    --hidden-import=pdf2image
+    --collect-all=pptx
+    --osx-bundle-identifier "com.pptcombiner.app"
+)
+
+# Check for Poppler (required for PDF support)
+if command -v brew &> /dev/null; then
+    POPPLER_PREFIX=$(brew --prefix poppler 2>/dev/null)
+    if [ ! -z "$POPPLER_PREFIX" ] && [ -d "$POPPLER_PREFIX/bin" ]; then
+        echo "Found Poppler at $POPPLER_PREFIX"
+        # Add Poppler binaries to the bundle
+        # We add the whole bin folder to a 'poppler' directory in the bundle
+        PYINSTALLER_ARGS+=(--add-binary "$POPPLER_PREFIX/bin/*:poppler")
+        echo "Enabled PDF support (bundled Poppler)."
+    else
+        echo "⚠️  Poppler not found via Homebrew."
+        echo "   PDF support might not work on machines without Poppler installed."
+        echo "   Install it with: brew install poppler"
+    fi
+else
+    echo "⚠️  Homebrew not found. Cannot auto-detect Poppler."
+fi
+
 # Build the standalone app
 echo "Building app bundle..."
-pyinstaller --name "PowerPoint Combiner" \
-    --windowed \
-    --onedir \
-    --clean \
-    --hidden-import=pptx \
-    --hidden-import=pptx.presentation \
-    --hidden-import=pptx.util \
-    --hidden-import=pptx.enum \
-    --hidden-import=lxml \
-    --hidden-import=lxml.etree \
-    --collect-all=pptx \
-    --osx-bundle-identifier "com.pptcombiner.app" \
-    combine_powerpoints_gui.py
+pyinstaller "${PYINSTALLER_ARGS[@]}" combine_powerpoints_gui.py
 
 # Check if pyinstaller succeeded
 if [ $? -ne 0 ]; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PowerPoint Combiner - GUI Version
-Combine multiple PowerPoint files into one while preserving individual themes.
+Combine multiple PowerPoint and PDF files into one while preserving individual themes.
 """
 
 import os
@@ -11,14 +11,25 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from pptx import Presentation
 import threading
+import io
+
+# Try to import pdf2image for PDF support
+try:
+    from pdf2image import convert_from_path
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
 
 
 class PowerPointCombinerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("PowerPoint Combiner")
-        self.root.geometry("600x400")
+        self.root.geometry("600x450")
         self.root.resizable(True, True)
+
+        # Determine poppler path
+        self.poppler_path = self.get_poppler_path()
 
         # Variables
         self.input_folder = tk.StringVar()
@@ -26,6 +37,31 @@ class PowerPointCombinerGUI:
         self.output_filename = tk.StringVar(value="combined_presentation.pptx")
 
         self.setup_ui()
+        
+        if not PDF_SUPPORT:
+            self.root.after(100, lambda: messagebox.showwarning(
+                "PDF Support Missing", 
+                "The 'pdf2image' library was not found.\nPDF files will be ignored."))
+    
+    def get_poppler_path(self):
+        """Get the path to bundled poppler binaries if frozen."""
+        if getattr(sys, 'frozen', False):
+            # If running as a PyInstaller bundle
+            if hasattr(sys, '_MEIPASS'):
+                # PyInstaller onefile or onedir
+                bundled_path = os.path.join(sys._MEIPASS, 'poppler')
+                if os.path.exists(bundled_path):
+                    return bundled_path
+            
+            # Fallback for onedir if not in MEIPASS (sometimes usually in MacOS/Resources or similar depending on config)
+            # But with --add-binary or --add-data it usually ends up in MEIPASS or the executable dir.
+            # Let's check the executable directory too.
+            exe_dir = os.path.dirname(sys.executable)
+            bundled_path = os.path.join(exe_dir, 'poppler')
+            if os.path.exists(bundled_path):
+                return bundled_path
+                
+        return None  # Rely on PATH
 
     def setup_ui(self):
         """Create the user interface."""
@@ -68,7 +104,7 @@ class PowerPointCombinerGUI:
 
         # Status text area
         ttk.Label(main_frame, text="Status:").grid(row=5, column=0, sticky=tk.NW, pady=5)
-        self.status_text = tk.Text(main_frame, height=8, width=60, state='disabled')
+        self.status_text = tk.Text(main_frame, height=10, width=60, state='disabled')
         self.status_text.grid(row=5, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
 
         # Scrollbar for status text
@@ -77,7 +113,7 @@ class PowerPointCombinerGUI:
         self.status_text['yscrollcommand'] = scrollbar.set
 
         # Combine button
-        self.combine_button = ttk.Button(main_frame, text="Combine PowerPoints",
+        self.combine_button = ttk.Button(main_frame, text="Combine Files",
                                          command=self.combine_powerpoints,
                                          style="Accent.TButton")
         self.combine_button.grid(row=6, column=0, columnspan=3, pady=20)
@@ -87,7 +123,7 @@ class PowerPointCombinerGUI:
 
     def browse_input_folder(self):
         """Open dialog to select input folder."""
-        folder = filedialog.askdirectory(title="Select folder containing PowerPoint files")
+        folder = filedialog.askdirectory(title="Select folder containing PowerPoint/PDF files")
         if folder:
             self.input_folder.set(folder)
             # Auto-set output folder to same location if not set
@@ -108,9 +144,61 @@ class PowerPointCombinerGUI:
         self.status_text.config(state='disabled')
         self.root.update()
 
+    def process_pdf(self, pdf_path, prs):
+        """Convert PDF pages to images and add as slides."""
+        if not PDF_SUPPORT:
+            self.log_status(f"  Skipping {pdf_path.name}: pdf2image not installed.")
+            return False
+
+        self.log_status(f"  Converting PDF: {pdf_path.name}...")
+        try:
+            # Convert PDF to images
+            try:
+                images = convert_from_path(str(pdf_path), poppler_path=self.poppler_path)
+            except Exception as e:
+                if "poppler" in str(e).lower() or "pdfinfo" in str(e).lower():
+                    self.log_status(f"  Error: Poppler is not installed/found.")
+                    return False
+                raise e
+
+            slide_width = prs.slide_width
+            slide_height = prs.slide_height
+
+            for img in images:
+                layout_idx = 6 if len(prs.slide_layouts) > 6 else len(prs.slide_layouts) - 1
+                slide_layout = prs.slide_layouts[layout_idx]
+                slide = prs.slides.add_slide(slide_layout)
+
+                image_stream = io.BytesIO()
+                img.save(image_stream, format='PNG')
+                image_stream.seek(0)
+
+                img_w, img_h = img.size
+                aspect_ratio = img_w / img_h
+                slide_ratio = slide_width / slide_height
+                
+                if aspect_ratio > slide_ratio:
+                    new_w = slide_width
+                    new_h = new_w / aspect_ratio
+                    left = 0
+                    top = (slide_height - new_h) / 2
+                else:
+                    new_h = slide_height
+                    new_w = new_h * aspect_ratio
+                    top = 0
+                    left = (slide_width - new_w) / 2
+                
+                slide.shapes.add_picture(image_stream, left, top, new_w, new_h)
+            
+            self.log_status(f"  Added: {pdf_path.name} ({len(images)} slides)")
+            return True
+
+        except Exception as e:
+            self.log_status(f"  Error processing PDF {pdf_path.name}: {str(e)}")
+            return False
+
     def combine_powerpoints(self):
-        """Combine PowerPoint files in a separate thread."""
-        # Validate inputs
+        """Combine files in a separate thread."""
         if not self.input_folder.get():
             messagebox.showerror("Error", "Please select an input folder")
             return
@@ -123,85 +211,94 @@ class PowerPointCombinerGUI:
             messagebox.showerror("Error", "Please enter an output filename")
             return
 
-        # Ensure .pptx extension
         filename = self.output_filename.get()
         if not filename.endswith('.pptx'):
             filename += '.pptx'
             self.output_filename.set(filename)
 
-        # Clear status
         self.status_text.config(state='normal')
         self.status_text.delete(1.0, tk.END)
         self.status_text.config(state='disabled')
 
-        # Disable button and start progress
         self.combine_button.config(state='disabled')
         self.progress.start()
 
-        # Run combination in separate thread
         thread = threading.Thread(target=self.do_combine, daemon=True)
         thread.start()
 
     def do_combine(self):
-        """Perform the actual PowerPoint combination."""
+        """Perform the combination logic."""
         try:
             input_path = Path(self.input_folder.get())
             output_path = Path(self.output_folder.get()) / self.output_filename.get()
 
-            # Get all PowerPoint files
-            pptx_files = sorted(input_path.glob("*.pptx"))
-            pptx_files = [f for f in pptx_files if not f.name.startswith("~$")]
+            # Get files
+            files = []
+            for ext in ["*.pptx", "*.pdf"]:
+                files.extend(input_path.glob(ext))
+            
+            files = sorted(files, key=lambda p: p.name)
+            files = [f for f in files if not f.name.startswith("~$")]
 
-            if not pptx_files:
+            if not files:
                 self.root.after(0, lambda: messagebox.showerror("Error",
-                    f"No PowerPoint files found in '{input_path}'"))
+                    f"No PowerPoint or PDF files found in '{input_path}'"))
                 return
 
-            self.log_status(f"Found {len(pptx_files)} PowerPoint file(s):")
-            for ppt in pptx_files:
-                self.log_status(f"  - {ppt.name}")
+            self.log_status(f"Found {len(files)} file(s):")
+            for f in files:
+                self.log_status(f"  - {f.name}")
 
             self.log_status("\nCombining presentations...")
 
-            # Create combined presentation starting with first file
-            combined_prs = Presentation(pptx_files[0])
-            self.log_status(f"  Added: {pptx_files[0].name} ({len(combined_prs.slides)} slides)")
+            combined_prs = None
+            first_file = files[0]
 
-            # Add slides from remaining presentations
-            for pptx_file in pptx_files[1:]:
-                prs = Presentation(pptx_file)
+            # Initialize base presentation
+            if first_file.suffix.lower() == '.pptx':
+                try:
+                    combined_prs = Presentation(first_file)
+                    self.log_status(f"  Added: {first_file.name} ({len(combined_prs.slides)} slides) [Base]")
+                    start_index = 1
+                except Exception as e:
+                    self.log_status(f"Error loading base file: {str(e)}")
+                    raise e
+            else:
+                combined_prs = Presentation()
+                start_index = 0
 
-                for slide in prs.slides:
-                    slide_layout = slide.slide_layout
-
+            # Process files
+            for file_path in files[start_index:]:
+                if file_path.suffix.lower() == '.pptx':
                     try:
-                        new_slide = combined_prs.slides.add_slide(slide_layout)
-
-                        # Copy all shapes from original slide
-                        for shape in slide.shapes:
-                            el = shape.element
-                            new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
-
+                        prs = Presentation(file_path)
+                        for slide in prs.slides:
+                            slide_layout = slide.slide_layout
+                            try:
+                                new_slide = combined_prs.slides.add_slide(slide_layout)
+                                for shape in slide.shapes:
+                                    el = shape.element
+                                    new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
+                            except Exception:
+                                blank_layout = combined_prs.slide_layouts[6]
+                                new_slide = combined_prs.slides.add_slide(blank_layout)
+                                for shape in slide.shapes:
+                                    el = shape.element
+                                    new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
+                        self.log_status(f"  Added: {file_path.name} ({len(prs.slides)} slides)")
                     except Exception as e:
-                        # Fallback to blank layout
-                        blank_layout = combined_prs.slide_layouts[6]
-                        new_slide = combined_prs.slides.add_slide(blank_layout)
+                        self.log_status(f"  Error adding {file_path.name}: {str(e)}")
 
-                        for shape in slide.shapes:
-                            el = shape.element
-                            new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
+                elif file_path.suffix.lower() == '.pdf':
+                    self.process_pdf(file_path, combined_prs)
 
-                self.log_status(f"  Added: {pptx_file.name} ({len(prs.slides)} slides)")
-
-            # Save combined presentation
             combined_prs.save(str(output_path))
 
             self.log_status(f"\nSuccess! Created: {output_path}")
             self.log_status(f"Total slides: {len(combined_prs.slides)}")
 
-            # Show success message
             self.root.after(0, lambda: messagebox.showinfo("Success",
-                f"Successfully combined {len(pptx_files)} presentations!\n\n"
+                f"Successfully combined {len(files)} files!\n"
                 f"Output: {output_path}\n"
                 f"Total slides: {len(combined_prs.slides)}"))
 
@@ -211,7 +308,6 @@ class PowerPointCombinerGUI:
                 f"An error occurred:\n{str(e)}"))
 
         finally:
-            # Re-enable button and stop progress
             self.root.after(0, lambda: self.combine_button.config(state='normal'))
             self.root.after(0, lambda: self.progress.stop())
 
