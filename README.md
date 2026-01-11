@@ -4,7 +4,19 @@ Combine multiple PowerPoint files into one while preserving each file's original
 
 ## Quick Start (Mac Users)
 
-### Option 1: Double-Click App (Easiest)
+### Option 1: Standalone App - NO Python Required! (Recommended for sharing)
+**Perfect for sending to friends who don't have Python installed.**
+
+1. Build the standalone app (one-time setup):
+   ```bash
+   ./build_mac_standalone.sh
+   ```
+2. Double-click "PowerPoint Combiner.app" to run
+3. Share the .app file with anyone - it works without Python!
+
+**Note:** macOS may show a security warning on first launch since the app isn't signed. Go to System Preferences > Security & Privacy to allow it.
+
+### Option 2: Double-Click App (Requires Python)
 1. Run the setup script:
    ```bash
    ./create_mac_app.sh
@@ -12,11 +24,11 @@ Combine multiple PowerPoint files into one while preserving each file's original
 2. Double-click the "PowerPoint Combiner.app" that was created
 3. Use the GUI to select your folder and combine presentations
 
-### Option 2: Simple Launcher
+### Option 3: Simple Launcher (Requires Python)
 1. Double-click `launch_mac.sh` (it will auto-setup everything)
 2. The GUI will open automatically
 
-### Option 3: Manual Installation
+### Option 4: Manual Installation
 Install the required dependency:
 ```bash
 pip install -r requirements.txt
