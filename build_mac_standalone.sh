@@ -4,11 +4,9 @@
 
 echo "Building standalone PowerPoint Combiner for Mac..."
 
-# Check if PyInstaller is installed
-if ! command -v pyinstaller &> /dev/null; then
-    echo "PyInstaller not found. Installing..."
-    pip install pyinstaller
-fi
+# Install required dependencies
+echo "Installing dependencies..."
+pip3 install -r requirements.txt
 
 # Clean previous builds
 echo "Cleaning previous builds..."
@@ -18,11 +16,23 @@ rm -rf build dist "PowerPoint Combiner.app"
 echo "Building app bundle..."
 pyinstaller --name "PowerPoint Combiner" \
     --windowed \
-    --onefile \
+    --onedir \
     --clean \
-    --icon=NONE \
+    --hidden-import=pptx \
+    --hidden-import=pptx.presentation \
+    --hidden-import=pptx.util \
+    --hidden-import=pptx.enum \
+    --hidden-import=lxml \
+    --hidden-import=lxml.etree \
+    --collect-all=pptx \
     --osx-bundle-identifier "com.pptcombiner.app" \
     combine_powerpoints_gui.py
+
+# Check if pyinstaller succeeded
+if [ $? -ne 0 ]; then
+    echo "❌ PyInstaller build failed. Check the error messages above."
+    exit 1
+fi
 
 # Move the app to the current directory for easy access
 if [ -d "dist/PowerPoint Combiner.app" ]; then
