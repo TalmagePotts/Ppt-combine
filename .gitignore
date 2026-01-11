@@ -36,6 +36,12 @@ wheels/
 *.swo
 *~
 
+# Claude Code
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Mac App Bundle (generated)
+PowerPoint Combiner.app/
