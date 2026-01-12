@@ -166,7 +166,71 @@ class PowerPointCombinerGUI:
         self.status_text.config(state='disabled')
         self.root.update()
 
-    def process_pdf(self, pdf_path, prs):
+    def add_fitted_image_slide(self, prs, image_source, match_aspect_ratio=False):
+        """Add a slide with an image. Optionally adjust presentation aspect ratio to match image."""
+        layout_idx = 6 if len(prs.slide_layouts) > 6 else len(prs.slide_layouts) - 1
+        slide_layout = prs.slide_layouts[layout_idx]
+        slide = prs.slides.add_slide(slide_layout)
+        
+        img_w = 0
+        img_h = 0
+        
+        # Get dimensions
+        if isinstance(image_source, (str, Path)):
+             from PIL import Image
+             with Image.open(str(image_source)) as img:
+                 img_w, img_h = img.size
+        else:
+             # PIL Image object
+             img_w, img_h = image_source.size
+             
+        if img_h == 0: return # Safety
+
+        # Calculate Image Aspect Ratio
+        img_ratio = img_w / img_h
+
+        # Optionally resize presentation to match image aspect ratio
+        # We keep width constant and adjust height
+        if match_aspect_ratio:
+            try:
+                # Standard width is usually 10 inches or 13.33 inches (screen)
+                # We trust the current width and adjust height
+                new_slide_height = int(prs.slide_width / img_ratio)
+                prs.slide_height = new_slide_height
+                self.log_status(f"    Adjusted presentation aspect ratio to match image ({img_ratio:.2f})")
+            except Exception as e:
+                self.log_status(f"    Warning: Could not resize slide: {e}")
+
+        # Calculate fit
+        slide_width = prs.slide_width
+        slide_height = prs.slide_height
+        
+        slide_ratio = slide_width / slide_height
+        
+        if img_ratio > slide_ratio:
+            # Image is wider -> Fit to width
+            new_w = slide_width
+            new_h = new_w / img_ratio
+            left = 0
+            top = (slide_height - new_h) / 2
+        else:
+            # Image is taller/same -> Fit to height
+            new_h = slide_height
+            new_w = new_h * img_ratio
+            top = 0
+            left = (slide_width - new_w) / 2
+            
+        # Add picture
+        if isinstance(image_source, (str, Path)):
+             slide.shapes.add_picture(str(image_source), left, top, new_w, new_h)
+        else:
+             # Stream from PIL image
+             image_stream = io.BytesIO()
+             image_source.save(image_stream, format='PNG')
+             image_stream.seek(0)
+             slide.shapes.add_picture(image_stream, left, top, new_w, new_h)
+
+    def process_pdf(self, pdf_path, prs, is_first_file=False):
         """Convert PDF pages to images and add as slides."""
         if not PDF_SUPPORT:
             self.log_status(f"  Skipping {pdf_path.name}: pdf2image not installed.")
@@ -183,34 +247,10 @@ class PowerPointCombinerGUI:
                     return False
                 raise e
 
-            slide_width = prs.slide_width
-            slide_height = prs.slide_height
-
-            for img in images:
-                layout_idx = 6 if len(prs.slide_layouts) > 6 else len(prs.slide_layouts) - 1
-                slide_layout = prs.slide_layouts[layout_idx]
-                slide = prs.slides.add_slide(slide_layout)
-
-                image_stream = io.BytesIO()
-                img.save(image_stream, format='PNG')
-                image_stream.seek(0)
-
-                img_w, img_h = img.size
-                aspect_ratio = img_w / img_h
-                slide_ratio = slide_width / slide_height
-                
-                if aspect_ratio > slide_ratio:
-                    new_w = slide_width
-                    new_h = new_w / aspect_ratio
-                    left = 0
-                    top = (slide_height - new_h) / 2
-                else:
-                    new_h = slide_height
-                    new_w = new_h * aspect_ratio
-                    top = 0
-                    left = (slide_width - new_w) / 2
-                
-                slide.shapes.add_picture(image_stream, left, top, new_w, new_h)
+            for i, img in enumerate(images):
+                # Resize slide to match the VERY FIRST image of the FIRST file
+                should_match = (is_first_file and i == 0)
+                self.add_fitted_image_slide(prs, img, match_aspect_ratio=should_match)
             
             self.log_status(f"  Added: {pdf_path.name} ({len(images)} slides)")
             return True
@@ -303,17 +343,26 @@ class PowerPointCombinerGUI:
                 
     def convert_pptx_to_images_macos(self, input_path, output_folder):
         """Convert PPTX to Images by first exporting to PDF (Robust)."""
-        import tempfile
         import uuid
         
         input_abs = os.path.abspath(str(input_path))
         output_abs = os.path.abspath(str(output_folder))
+        input_dir = os.path.dirname(input_abs)
         
-        # Use system temp dir for the intermediate PDF to avoid path issues
-        temp_pdf = os.path.join(tempfile.gettempdir(), f"ppt_export_{uuid.uuid4().hex}.pdf")
+        # Use a temp file in the SAME directory as input to ensure permissions match
+        temp_filename = f"temp_export_{uuid.uuid4().hex[:8]}.pdf"
+        temp_pdf = os.path.join(input_dir, temp_filename)
         
         # Ensure output directory exists
         os.makedirs(output_abs, exist_ok=True)
+        
+        # Create a placeholder file to ensure the path is valid for AppleScript
+        try:
+            with open(temp_pdf, 'wb') as f:
+                pass
+        except Exception as e:
+            self.log_status(f"    Error creating placeholder file: {e}")
+            return False
         
         # AppleScript to convert PPTX to PDF
         script = f'''
@@ -324,7 +373,8 @@ class PowerPointCombinerGUI:
                 open POSIX file "{input_abs}" with read only
                 set activePres to active presentation
                 
-                -- Save as PDF using POSIX file reference
+                -- Save as PDF
+                -- We use the existing placeholder file which helps with permissions/path resolution
                 save activePres in POSIX file "{temp_pdf}" as save as PDF
                 
                 -- Close without saving changes
@@ -355,10 +405,14 @@ class PowerPointCombinerGUI:
             result = process.stdout.strip()
             if result.startswith("Error:"):
                  self.log_status(f"    PPT Error: {result}")
+                 # Cleanup placeholder if it failed
+                 try: os.remove(temp_pdf) 
+                 except: pass
                  return False
             
-            if not os.path.exists(temp_pdf):
-                self.log_status(f"    Error: PDF export failed. Expected at: {temp_pdf}")
+            # Check if file has size (meaning it was written to)
+            if not os.path.exists(temp_pdf) or os.path.getsize(temp_pdf) == 0:
+                self.log_status(f"    Error: PDF export failed (File empty or missing at {temp_pdf}).")
                 return False
             
             # 2. Convert PDF to Images using pdf2image
@@ -448,6 +502,7 @@ class PowerPointCombinerGUI:
 
             combined_prs = None
             first_file = files[0]
+            started_blank = False
 
             # Initialize base presentation
             if first_file.suffix.lower() == '.pptx':
@@ -455,15 +510,19 @@ class PowerPointCombinerGUI:
                     combined_prs = Presentation(first_file)
                     self.log_status(f"  Added: {first_file.name} ({len(combined_prs.slides)} slides) [Base]")
                     start_index = 1
+                    started_blank = False
                 except Exception as e:
                     self.log_status(f"Error loading base file: {str(e)}")
                     raise e
             else:
                 combined_prs = Presentation()
                 start_index = 0
+                started_blank = True
 
             # Process files
-            for file_path in files[start_index:]:
+            for i, file_path in enumerate(files[start_index:]):
+                is_very_first = (started_blank and i == 0)
+                
                 if file_path.suffix.lower() == '.pptx':
                     if convert_images and self.can_use_applescript:
                         # Convert PPTX to Images using AppleScript
@@ -494,18 +553,11 @@ class PowerPointCombinerGUI:
                                 self.log_status(f"    Warning: No images found after export.")
                                 success = False
                             else:
-                                # Add each image as a slide
-                                slide_width = combined_prs.slide_width
-                                slide_height = combined_prs.slide_height
-                                
-                                for img_path in image_files:
-                                    layout_idx = 6 if len(combined_prs.slide_layouts) > 6 else len(combined_prs.slide_layouts) - 1
-                                    slide_layout = combined_prs.slide_layouts[layout_idx]
-                                    slide = combined_prs.slides.add_slide(slide_layout)
-                                    
-                                    # Add picture filling the slide
+                                # Add each image as a slide with proper fitting
+                                for j, img_path in enumerate(image_files):
                                     try:
-                                        slide.shapes.add_picture(str(img_path), 0, 0, slide_width, slide_height)
+                                        match = (is_very_first and j == 0)
+                                        self.add_fitted_image_slide(combined_prs, img_path, match_aspect_ratio=match)
                                     except Exception as e:
                                         self.log_status(f"    Error adding image {img_path.name}: {e}")
 
@@ -539,7 +591,7 @@ class PowerPointCombinerGUI:
                         self.log_status(f"  Error adding {file_path.name}: {str(e)}")
 
                 elif file_path.suffix.lower() == '.pdf':
-                    self.process_pdf(file_path, combined_prs)
+                    self.process_pdf(file_path, combined_prs, is_first_file=is_very_first)
 
             combined_prs.save(str(output_path))
 
