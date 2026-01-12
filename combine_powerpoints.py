@@ -10,6 +10,7 @@ import sys
 import io
 from pathlib import Path
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 # Try to import pdf2image for PDF support
 try:
@@ -93,6 +94,52 @@ def process_pdf(pdf_path, prs):
         return False
 
 
+def copy_slide_elements(source_slide, target_slide):
+    """
+    Copy shapes from source_slide to target_slide safely.
+    This avoids XML injection which can cause corruption.
+    """
+    for shape in source_slide.shapes:
+        try:
+            # 1. Pictures
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                # Extract image blob
+                if hasattr(shape, 'image'):
+                    blob = shape.image.blob
+                    image_stream = io.BytesIO(blob)
+                    target_slide.shapes.add_picture(
+                        image_stream, 
+                        shape.left, shape.top, 
+                        shape.width, shape.height
+                    )
+            
+            # 2. Text Boxes and Shapes
+            elif shape.has_text_frame:
+                new_shape = None
+                if shape.shape_type == MSO_SHAPE_TYPE.TEXT_BOX:
+                    new_shape = target_slide.shapes.add_textbox(
+                        shape.left, shape.top,
+                        shape.width, shape.height
+                    )
+                elif shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+                    # Try to preserve auto shape type
+                    new_shape = target_slide.shapes.add_shape(
+                        shape.auto_shape_type,
+                        shape.left, shape.top,
+                        shape.width, shape.height
+                    )
+                
+                # Copy Text
+                if new_shape and shape.text_frame.text:
+                    new_shape.text_frame.text = shape.text_frame.text
+                    # We could copy paragraphs/runs here for better fidelity
+                    # but simple text is safest to start with.
+                    
+        except Exception as e:
+            # If a specific shape fails, skip it but continue with others
+            print(f"    Warning: Could not copy a shape: {e}")
+            pass
+
 def combine_powerpoints(input_folder, output_file):
     """
     Combine all PowerPoint and PDF files in a folder into a single presentation.
@@ -156,39 +203,15 @@ def combine_powerpoints(input_folder, output_file):
                 prs = Presentation(file_path)
 
                 for slide in prs.slides:
-                    # Copy the slide with its layout and master to preserve theme
-                    slide_layout = slide.slide_layout
-
-                    try:
-                        # Add slide layout from source to destination if not already present
-                        new_slide = combined_prs.slides.add_slide(slide_layout)
-
-                        # Copy all shapes from the original slide
-                        for shape in slide.shapes:
-                            el = shape.element
-                            new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
-
-                        # Remove the default shapes that came with the layout
-                        for shape in new_slide.shapes:
-                            if shape not in [s for s in slide.shapes]:
-                                try:
-                                    if hasattr(shape, 'is_placeholder') and shape.is_placeholder:
-                                        # Note: Deleting shapes directly can be tricky, 
-                                        # but often ignoring them or careful removal works.
-                                        # For now, we leave them as the original code did, 
-                                        # or try to rely on the insert_element_before approach.
-                                        pass
-                                except:
-                                    pass
-
-                    except Exception:
-                        # Fallback: simpler approach
-                        blank_layout = combined_prs.slide_layouts[6]
-                        new_slide = combined_prs.slides.add_slide(blank_layout)
-
-                        for shape in slide.shapes:
-                            el = shape.element
-                            new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
+                    # Use a blank layout from the DESTINATION presentation
+                    # Index 6 is usually "Blank" in standard templates
+                    layout_idx = 6 if len(combined_prs.slide_layouts) > 6 else len(combined_prs.slide_layouts) - 1
+                    blank_layout = combined_prs.slide_layouts[layout_idx]
+                    
+                    new_slide = combined_prs.slides.add_slide(blank_layout)
+                    
+                    # Safe copy of elements
+                    copy_slide_elements(slide, new_slide)
 
                 print(f"  Added: {file_path.name} ({len(prs.slides)} slides)")
             except Exception as e:

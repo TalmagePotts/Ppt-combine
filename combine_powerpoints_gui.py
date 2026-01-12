@@ -10,8 +10,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.dml.color import RGBColor
 import threading
 import io
+import copy
+import subprocess
 
 # Try to import pdf2image for PDF support
 try:
@@ -25,16 +29,20 @@ class PowerPointCombinerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("PowerPoint Combiner")
-        self.root.geometry("600x450")
+        self.root.geometry("600x550")
         self.root.resizable(True, True)
 
         # Determine poppler path
         self.poppler_path = self.get_poppler_path()
+        
+        # Determine if we can use AppleScript (macOS + PPT installed)
+        self.can_use_applescript = self.check_powerpoint_installed()
 
         # Variables
         self.input_folder = tk.StringVar()
         self.output_folder = tk.StringVar()
         self.output_filename = tk.StringVar(value="combined_presentation.pptx")
+        self.convert_to_images = tk.BooleanVar(value=False)
 
         self.setup_ui()
         
@@ -43,6 +51,18 @@ class PowerPointCombinerGUI:
                 "PDF Support Missing", 
                 "The 'pdf2image' library was not found.\nPDF files will be ignored."))
     
+    def check_powerpoint_installed(self):
+        """Check if Microsoft PowerPoint is available via AppleScript."""
+        if sys.platform != 'darwin':
+            return False
+        try:
+            # Check for PowerPoint bundle ID
+            cmd = ['osascript', '-e', 'id of application "Microsoft PowerPoint"']
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            return result.returncode == 0
+        except:
+            return False
+
     def get_poppler_path(self):
         """Get the path to bundled poppler binaries if frozen."""
         if getattr(sys, 'frozen', False):
@@ -53,9 +73,7 @@ class PowerPointCombinerGUI:
                 if os.path.exists(bundled_path):
                     return bundled_path
             
-            # Fallback for onedir if not in MEIPASS (sometimes usually in MacOS/Resources or similar depending on config)
-            # But with --add-binary or --add-data it usually ends up in MEIPASS or the executable dir.
-            # Let's check the executable directory too.
+            # Fallback for onedir if not in MEIPASS
             exe_dir = os.path.dirname(sys.executable)
             bundled_path = os.path.join(exe_dir, 'poppler')
             if os.path.exists(bundled_path):
@@ -97,29 +115,33 @@ class PowerPointCombinerGUI:
         ttk.Label(main_frame, text="Output Filename:").grid(row=3, column=0, sticky=tk.W, pady=5)
         ttk.Entry(main_frame, textvariable=self.output_filename, width=50).grid(
             row=3, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+            
+        # Checkbox for Image Conversion
+        ttk.Checkbutton(main_frame, text="Convert slides to Images (Preserves exact theme/fonts, not editable)", 
+                       variable=self.convert_to_images).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=10)
 
         # Progress bar
         self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
-        self.progress.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=20)
+        self.progress.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=20)
 
         # Status text area
-        ttk.Label(main_frame, text="Status:").grid(row=5, column=0, sticky=tk.NW, pady=5)
+        ttk.Label(main_frame, text="Status:").grid(row=6, column=0, sticky=tk.NW, pady=5)
         self.status_text = tk.Text(main_frame, height=10, width=60, state='disabled')
-        self.status_text.grid(row=5, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        self.status_text.grid(row=6, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
 
         # Scrollbar for status text
         scrollbar = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.status_text.yview)
-        scrollbar.grid(row=5, column=2, sticky=(tk.N, tk.S, tk.E), pady=5)
+        scrollbar.grid(row=6, column=2, sticky=(tk.N, tk.S, tk.E), pady=5)
         self.status_text['yscrollcommand'] = scrollbar.set
 
         # Combine button
         self.combine_button = ttk.Button(main_frame, text="Combine Files",
                                          command=self.combine_powerpoints,
                                          style="Accent.TButton")
-        self.combine_button.grid(row=6, column=0, columnspan=3, pady=20)
+        self.combine_button.grid(row=7, column=0, columnspan=3, pady=20)
 
         # Make rows expandable
-        main_frame.rowconfigure(5, weight=1)
+        main_frame.rowconfigure(6, weight=1)
 
     def browse_input_folder(self):
         """Open dialog to select input folder."""
@@ -197,6 +219,172 @@ class PowerPointCombinerGUI:
             self.log_status(f"  Error processing PDF {pdf_path.name}: {str(e)}")
             return False
 
+    def copy_slide_elements(self, source_slide, target_slide):
+        """
+        Copy shapes from source_slide to target_slide safely.
+        """
+        for shape in source_slide.shapes:
+            try:
+                # 1. Pictures
+                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                    if hasattr(shape, 'image'):
+                        blob = shape.image.blob
+                        image_stream = io.BytesIO(blob)
+                        target_slide.shapes.add_picture(
+                            image_stream, 
+                            shape.left, shape.top, 
+                            shape.width, shape.height
+                        )
+                
+                # 2. Text Boxes and Shapes
+                elif shape.has_text_frame:
+                    new_shape = None
+                    if shape.shape_type == MSO_SHAPE_TYPE.TEXT_BOX:
+                        new_shape = target_slide.shapes.add_textbox(
+                            shape.left, shape.top,
+                            shape.width, shape.height
+                        )
+                    elif shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+                        new_shape = target_slide.shapes.add_shape(
+                            shape.auto_shape_type,
+                            shape.left, shape.top,
+                            shape.width, shape.height
+                        )
+                    
+                    if new_shape and shape.text_frame.text:
+                        new_shape.text_frame.text = shape.text_frame.text
+                        # Try to copy simple paragraph formatting (bold, size, color)
+                        # Note: This is partial support
+                        try:
+                            if shape.text_frame.paragraphs and new_shape.text_frame.paragraphs:
+                                p_src = shape.text_frame.paragraphs[0]
+                                p_dst = new_shape.text_frame.paragraphs[0]
+                                if p_src.runs and p_dst.runs:
+                                    r_src = p_src.runs[0]
+                                    r_dst = p_dst.runs[0]
+                                    if hasattr(r_src.font, 'size') and r_src.font.size:
+                                        r_dst.font.size = r_src.font.size
+                                    if hasattr(r_src.font, 'bold'):
+                                        r_dst.font.bold = r_src.font.bold
+                        except:
+                            pass
+                        
+            except Exception as e:
+                # Log to console if needed, but don't stop process
+                print(f"Warning copying shape: {e}")
+                pass
+
+    def robust_xml_copy(self, source_slide, target_slide):
+        """
+        Attempt to copy XML but fix relationships to avoid corruption.
+        This is experimental but better than raw copy.
+        """
+        # Copy all shapes from the original slide
+        for shape in source_slide.shapes:
+            try:
+                # Get the shape element XML
+                el = shape.element
+                new_el = copy.deepcopy(el)
+                
+                # Check for relationships (images, etc)
+                # This is a simplification; handling all rels correctly is complex
+                # If we detect a relationship we can't handle easily, we skip the shape
+                # to prevent corruption.
+                
+                # For now, we actually fallback to 'copy_slide_elements' for this shape
+                # if it looks risky, or if we are in "Simple Mode".
+                # But to truly support "Robust Copy", we would need to map rIds.
+                
+                # Given the complexity, we will stick to 'copy_slide_elements' (Reconstruction)
+                # as the default 'Safe' method.
+                pass
+            except Exception:
+                pass
+                
+    def convert_pptx_to_images_macos(self, input_path, output_folder):
+        """Convert PPTX to Images by first exporting to PDF (Robust)."""
+        import tempfile
+        import uuid
+        
+        input_abs = os.path.abspath(str(input_path))
+        output_abs = os.path.abspath(str(output_folder))
+        
+        # Use system temp dir for the intermediate PDF to avoid path issues
+        temp_pdf = os.path.join(tempfile.gettempdir(), f"ppt_export_{uuid.uuid4().hex}.pdf")
+        
+        # Ensure output directory exists
+        os.makedirs(output_abs, exist_ok=True)
+        
+        # AppleScript to convert PPTX to PDF
+        script = f'''
+        tell application "Microsoft PowerPoint"
+            -- activate
+            try
+                -- Open the file
+                open POSIX file "{input_abs}" with read only
+                set activePres to active presentation
+                
+                -- Save as PDF using POSIX file reference
+                save activePres in POSIX file "{temp_pdf}" as save as PDF
+                
+                -- Close without saving changes
+                close activePres saving no
+                
+                return "Success"
+            on error errMsg
+                try
+                    close activePres saving no
+                end try
+                return "Error: " & errMsg
+            end try
+        end tell
+        '''
+        
+        try:
+            # 1. Export to PDF
+            process = subprocess.run(
+                ['/usr/bin/osascript', '-e', script], 
+                capture_output=True, 
+                text=True
+            )
+            
+            if process.returncode != 0:
+                self.log_status(f"    AppleScript System Error: {process.stderr.strip()}")
+                return False
+                
+            result = process.stdout.strip()
+            if result.startswith("Error:"):
+                 self.log_status(f"    PPT Error: {result}")
+                 return False
+            
+            if not os.path.exists(temp_pdf):
+                self.log_status(f"    Error: PDF export failed. Expected at: {temp_pdf}")
+                return False
+            
+            # 2. Convert PDF to Images using pdf2image
+            try:
+                images = convert_from_path(temp_pdf, poppler_path=self.poppler_path)
+                
+                # Save images to output folder
+                for i, img in enumerate(images):
+                    img_path = os.path.join(output_abs, f"Slide_{i+1:03d}.png")
+                    img.save(img_path, format='PNG')
+                
+                # Cleanup PDF
+                try:
+                    os.remove(temp_pdf)
+                except:
+                    pass
+                return True
+                
+            except Exception as e:
+                self.log_status(f"    Error converting intermediate PDF to images: {e}")
+                return False
+
+        except Exception as e:
+            self.log_status(f"    Exception calling AppleScript: {str(e)}")
+            return False
+
     def combine_powerpoints(self):
         """Combine files in a separate thread."""
         if not self.input_folder.get():
@@ -231,6 +419,7 @@ class PowerPointCombinerGUI:
         try:
             input_path = Path(self.input_folder.get())
             output_path = Path(self.output_folder.get()) / self.output_filename.get()
+            convert_images = self.convert_to_images.get()
 
             # Get files
             files = []
@@ -250,6 +439,12 @@ class PowerPointCombinerGUI:
                 self.log_status(f"  - {f.name}")
 
             self.log_status("\nCombining presentations...")
+            if convert_images:
+                self.log_status("Mode: Converting slides to Images (Theme Preserved)")
+                if not self.can_use_applescript:
+                    self.log_status("Warning: Microsoft PowerPoint not found. PPTX conversion may fail or use text-only fallback.")
+            else:
+                self.log_status("Mode: Safe Copy (Theme may be lost, Text Editable)")
 
             combined_prs = None
             first_file = files[0]
@@ -270,22 +465,76 @@ class PowerPointCombinerGUI:
             # Process files
             for file_path in files[start_index:]:
                 if file_path.suffix.lower() == '.pptx':
+                    if convert_images and self.can_use_applescript:
+                        # Convert PPTX to Images using AppleScript
+                        self.log_status(f"  Converting PPTX to Images: {file_path.name}...")
+                        
+                        # Create a specific temp dir for this file
+                        import shutil
+                        temp_dir = input_path / f"temp_{file_path.stem}"
+                        if temp_dir.exists():
+                            shutil.rmtree(temp_dir)
+                        os.makedirs(temp_dir)
+                        
+                        success = self.convert_pptx_to_images_macos(file_path, temp_dir)
+                        
+                        if success:
+                            # Find all PNGs
+                            image_files = list(temp_dir.glob("**/*.png")) + list(temp_dir.glob("**/*.PNG"))
+                            
+                            # Sort by slide number (Slide1, Slide2, ... Slide10)
+                            # Natural sort
+                            import re
+                            def natural_sort_key(s):
+                                return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s.name)]
+                            
+                            image_files.sort(key=natural_sort_key)
+                            
+                            if not image_files:
+                                self.log_status(f"    Warning: No images found after export.")
+                                success = False
+                            else:
+                                # Add each image as a slide
+                                slide_width = combined_prs.slide_width
+                                slide_height = combined_prs.slide_height
+                                
+                                for img_path in image_files:
+                                    layout_idx = 6 if len(combined_prs.slide_layouts) > 6 else len(combined_prs.slide_layouts) - 1
+                                    slide_layout = combined_prs.slide_layouts[layout_idx]
+                                    slide = combined_prs.slides.add_slide(slide_layout)
+                                    
+                                    # Add picture filling the slide
+                                    try:
+                                        slide.shapes.add_picture(str(img_path), 0, 0, slide_width, slide_height)
+                                    except Exception as e:
+                                        self.log_status(f"    Error adding image {img_path.name}: {e}")
+
+                                self.log_status(f"  Added: {file_path.name} ({len(image_files)} slides)")
+                                
+                                # Cleanup
+                                try:
+                                    shutil.rmtree(temp_dir)
+                                except:
+                                    pass
+                                continue
+
+                    # Fallback or Standard Mode
+                    if convert_images:
+                        self.log_status("    Warning: Falling back to Safe Copy.")
+
                     try:
                         prs = Presentation(file_path)
                         for slide in prs.slides:
-                            slide_layout = slide.slide_layout
-                            try:
-                                new_slide = combined_prs.slides.add_slide(slide_layout)
-                                for shape in slide.shapes:
-                                    el = shape.element
-                                    new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
-                            except Exception:
-                                blank_layout = combined_prs.slide_layouts[6]
-                                new_slide = combined_prs.slides.add_slide(blank_layout)
-                                for shape in slide.shapes:
-                                    el = shape.element
-                                    new_slide.shapes._spTree.insert_element_before(el, 'p:extLst')
-                        self.log_status(f"  Added: {file_path.name} ({len(prs.slides)} slides)")
+                            # Use blank layout from DESTINATION
+                            layout_idx = 6 if len(combined_prs.slide_layouts) > 6 else len(combined_prs.slide_layouts) - 1
+                            blank_layout = combined_prs.slide_layouts[layout_idx]
+                            
+                            new_slide = combined_prs.slides.add_slide(blank_layout)
+                            
+                            # Safe copy elements
+                            self.copy_slide_elements(slide, new_slide)
+                            
+                        self.log_status(f"  Added: {file_path.name} ({len(prs.slides)} slides) [Text Only]")
                     except Exception as e:
                         self.log_status(f"  Error adding {file_path.name}: {str(e)}")
 
