@@ -42,7 +42,8 @@ class PowerPointCombinerGUI:
         self.input_folder = tk.StringVar()
         self.output_folder = tk.StringVar()
         self.output_filename = tk.StringVar(value="combined_presentation.pptx")
-        self.convert_to_images = tk.BooleanVar(value=False)
+        self.convert_to_images = tk.BooleanVar(value=True)
+        self.cancel_flag = threading.Event()
 
         self.setup_ui()
         
@@ -125,7 +126,8 @@ class PowerPointCombinerGUI:
         self.progress.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=20)
 
         # Status text area
-        ttk.Label(main_frame, text="Status:").grid(row=6, column=0, sticky=tk.NW, pady=5)
+        self.status_label = ttk.Label(main_frame, text="Status:")
+        self.status_label.grid(row=6, column=0, sticky=tk.NW, pady=5)
         self.status_text = tk.Text(main_frame, height=10, width=60, state='disabled')
         self.status_text.grid(row=6, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
 
@@ -134,11 +136,21 @@ class PowerPointCombinerGUI:
         scrollbar.grid(row=6, column=2, sticky=(tk.N, tk.S, tk.E), pady=5)
         self.status_text['yscrollcommand'] = scrollbar.set
 
+        # Buttons Frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.grid(row=7, column=0, columnspan=3, pady=20)
+
         # Combine button
-        self.combine_button = ttk.Button(main_frame, text="Combine Files",
+        self.combine_button = ttk.Button(button_frame, text="Combine Files",
                                          command=self.combine_powerpoints,
                                          style="Accent.TButton")
-        self.combine_button.grid(row=7, column=0, columnspan=3, pady=20)
+        self.combine_button.pack(side=tk.LEFT, padx=5)
+        
+        # Cancel button
+        self.cancel_button = ttk.Button(button_frame, text="Cancel",
+                                        command=self.cancel_operation,
+                                        state='disabled')
+        self.cancel_button.pack(side=tk.LEFT, padx=5)
 
         # Make rows expandable
         main_frame.rowconfigure(6, weight=1)
@@ -165,6 +177,12 @@ class PowerPointCombinerGUI:
         self.status_text.see(tk.END)
         self.status_text.config(state='disabled')
         self.root.update()
+        
+    def cancel_operation(self):
+        """Signal the operation to stop."""
+        self.log_status("\nCancelling operation... please wait for current step to finish.")
+        self.cancel_flag.set()
+        self.cancel_button.config(state='disabled')
 
     def add_fitted_image_slide(self, prs, image_source, match_aspect_ratio=False):
         """Add a slide with an image. Optionally adjust presentation aspect ratio to match image."""
@@ -461,8 +479,17 @@ class PowerPointCombinerGUI:
         self.status_text.config(state='normal')
         self.status_text.delete(1.0, tk.END)
         self.status_text.config(state='disabled')
+        
+        # Reset status label
+        self.status_label.config(text="Status:")
 
+        # Reset cancel flag
+        self.cancel_flag.clear()
+        
+        # Toggle buttons
         self.combine_button.config(state='disabled')
+        self.cancel_button.config(state='normal')
+        
         self.progress.start()
 
         thread = threading.Thread(target=self.do_combine, daemon=True)
@@ -520,13 +547,32 @@ class PowerPointCombinerGUI:
                 started_blank = True
 
             # Process files
-            for i, file_path in enumerate(files[start_index:]):
+            files_to_process = files[start_index:]
+            total_files = len(files_to_process)
+            
+            # Configure determinate progress bar
+            self.root.after(0, lambda: self.progress.config(mode='determinate', maximum=total_files, value=0))
+
+            for i, file_path in enumerate(files_to_process):
+                # Check for cancellation
+                if self.cancel_flag.is_set():
+                    self.log_status("\nOperation cancelled by user.")
+                    break
+
+                current_num = i + 1
+                
+                # Update status label text
+                self.root.after(0, lambda c=current_num, t=total_files: 
+                               self.status_label.config(text=f"Status ({c}/{t}):"))
+                
+                self.log_status(f"\n[{current_num}/{total_files}] Processing: {file_path.name}...")
+                
                 is_very_first = (started_blank and i == 0)
                 
                 if file_path.suffix.lower() == '.pptx':
                     if convert_images and self.can_use_applescript:
                         # Convert PPTX to Images using AppleScript
-                        self.log_status(f"  Converting PPTX to Images: {file_path.name}...")
+                        self.log_status(f"  Converting PPTX to Images...")
                         
                         # Create a specific temp dir for this file
                         import shutil
@@ -555,6 +601,7 @@ class PowerPointCombinerGUI:
                             else:
                                 # Add each image as a slide with proper fitting
                                 for j, img_path in enumerate(image_files):
+                                    if self.cancel_flag.is_set(): break # Check inner loop
                                     try:
                                         match = (is_very_first and j == 0)
                                         self.add_fitted_image_slide(combined_prs, img_path, match_aspect_ratio=match)
@@ -568,6 +615,9 @@ class PowerPointCombinerGUI:
                                     shutil.rmtree(temp_dir)
                                 except:
                                     pass
+                                
+                                # Update progress
+                                self.root.after(0, lambda val=current_num: self.progress.configure(value=val))
                                 continue
 
                     # Fallback or Standard Mode
@@ -577,6 +627,7 @@ class PowerPointCombinerGUI:
                     try:
                         prs = Presentation(file_path)
                         for slide in prs.slides:
+                            if self.cancel_flag.is_set(): break
                             # Use blank layout from DESTINATION
                             layout_idx = 6 if len(combined_prs.slide_layouts) > 6 else len(combined_prs.slide_layouts) - 1
                             blank_layout = combined_prs.slide_layouts[layout_idx]
@@ -592,16 +643,22 @@ class PowerPointCombinerGUI:
 
                 elif file_path.suffix.lower() == '.pdf':
                     self.process_pdf(file_path, combined_prs, is_first_file=is_very_first)
+                
+                # Update progress
+                self.root.after(0, lambda val=current_num: self.progress.configure(value=val))
 
-            combined_prs.save(str(output_path))
+            if not self.cancel_flag.is_set():
+                combined_prs.save(str(output_path))
 
-            self.log_status(f"\nSuccess! Created: {output_path}")
-            self.log_status(f"Total slides: {len(combined_prs.slides)}")
+                self.log_status(f"\nSuccess! Created: {output_path}")
+                self.log_status(f"Total slides: {len(combined_prs.slides)}")
 
-            self.root.after(0, lambda: messagebox.showinfo("Success",
-                f"Successfully combined {len(files)} files!\n"
-                f"Output: {output_path}\n"
-                f"Total slides: {len(combined_prs.slides)}"))
+                self.root.after(0, lambda: messagebox.showinfo("Success",
+                    f"Successfully combined {len(files)} files!\n"
+                    f"Output: {output_path}\n"
+                    f"Total slides: {len(combined_prs.slides)}"))
+            else:
+                self.log_status(f"\nCancelled. Output not saved.")
 
         except Exception as e:
             self.log_status(f"\nError: {str(e)}")
@@ -610,6 +667,7 @@ class PowerPointCombinerGUI:
 
         finally:
             self.root.after(0, lambda: self.combine_button.config(state='normal'))
+            self.root.after(0, lambda: self.cancel_button.config(state='disabled'))
             self.root.after(0, lambda: self.progress.stop())
 
 

@@ -15,6 +15,10 @@ Combine multiple PowerPoint files into one while preserving each file's original
 3. Share the .app file with anyone - it works without Python!
 
 **Note:** macOS may show a security warning on first launch since the app isn't signed. Go to System Preferences > Security & Privacy to allow it.
+**Note 2:** Poppler is required on the machine building it. You can download it with:
+```bash
+brew install poppler
+```
 
 ### Option 2: Double-Click App (Requires Python)
 1. Run the setup script:
